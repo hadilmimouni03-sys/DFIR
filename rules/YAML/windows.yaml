@@ -1,0 +1,1221 @@
+
+id: MDF-0001
+title: Execution from a user-writable temp or download directory
+severity: high
+score: 40
+attack: [T1204.002]
+description: >
+  Legitimate software installs to Program Files and runs from there. Execution
+  recorded from Temp, Downloads or AppData is how most commodity malware and
+  most phishing payloads first run. This is the single highest-yield rule on a
+  normal endpoint -- and the noisiest on a developer or analyst machine, which
+  is what the exclusions are for.
+scope:
+  artifact_type: [prefetch_execution, amcache_file, shimcache, bam_execution,
+                  user_assist_execution]
+match:
+  any:
+    - field: raw_data.FullPath
+      contains_any: ["\\appdata\\local\\temp\\", "\\windows\\temp\\",
+                     "\\downloads\\", "\\users\\public\\", "\\appdata\\roaming\\"]
+    - field: raw_data.Path
+      contains_any: ["\\appdata\\local\\temp\\", "\\windows\\temp\\",
+                     "\\downloads\\", "\\users\\public\\"]
+    - field: description
+      regex: "(?i)\\\\(temp|downloads)\\\\[^\\\\]+\\.(exe|scr|pif|com|bat|cmd)"
+exclude:
+  - field: description
+    contains_any: ["\\temp\\chocolatey\\", "microsoftedgeupdate", "\\temp\\gdiplus"]
+
+---
+id: MDF-0002
+title: Living-off-the-land binary invoked with suspicious arguments
+severity: high
+score: 45
+attack: [T1218.011, T1218.010, T1105]
+description: >
+  rundll32, regsvr32, mshta, certutil and bitsadmin are signed Microsoft
+  binaries, so they defeat naive allow-listing. The binary is never the signal;
+  the ARGUMENT is. rundll32 loading a local DLL is Tuesday. rundll32 with a URL
+  in its arguments is not.
+scope:
+  artifact_type: [memory_cmdline, event_log, prefetch_execution]
+match:
+  all:
+    - field: description
+      contains_any: ["rundll32", "regsvr32", "mshta", "certutil",
+                     "bitsadmin", "wmic"]
+  any:
+    - field: description
+      contains_any: ["http://", "https://", "javascript:", "scrobj.dll",
+                     "-urlcache", "-decode", "/transfer", "\\\\"]
+    - field: raw_data.Args
+      contains_any: ["http://", "https://", "javascript:", "scrobj.dll"]
+
+---
+id: MDF-0003
+title: Autorun key points outside standard program directories
+severity: high
+score: 45
+attack: [T1547.001]
+description: >
+  Run and RunOnce keys are the most common userland persistence there is.
+  Vendors point them at Program Files. Attackers point them at AppData, Temp or
+  ProgramData, or at a script interpreter with arguments.
+scope:
+  artifact_type: [registry_run, registry_autoruns]
+match:
+  any:
+    - field: raw_data.ValueData
+      contains_any: ["\\appdata\\", "\\temp\\", "\\programdata\\",
+                     "\\users\\public\\", "powershell", "cmd.exe /c",
+                     "wscript", "cscript", "mshta", "rundll32"]
+exclude:
+  - field: raw_data.ValueData
+    contains_any: ["\\program files\\", "\\program files (x86)\\",
+                   "\\windows\\system32\\"]
+
+---
+id: MDF-0004
+title: Scheduled task running a script interpreter or a non-standard path
+severity: high
+score: 40
+attack: [T1053.005]
+description: >
+  Scheduled-task persistence. Microsoft's own tasks live under
+  \Windows\System32 and are authored by "Microsoft Corporation" -- which is
+  exactly why the author field is the exclusion, not the inclusion. Excluding
+  on author alone would be forgeable, so the match still requires a suspicious
+  target.
+scope:
+  artifact_type: [scheduled_task]
+match:
+  any:
+    - field: description
+      contains_any: ["powershell", "cmd.exe", "wscript", "cscript", "mshta",
+                     "rundll32", "\\appdata\\", "\\temp\\", "\\programdata\\",
+                     "\\users\\public\\"]
+exclude:
+  - field: raw_data.Author
+    contains_any: ["microsoft corporation"]
+
+---
+id: MDF-0005
+title: Service binary or hosting DLL outside standard system paths
+severity: high
+score: 45
+attack: [T1543.003, T1574.001]
+description: >
+  Service persistence survives reboots and runs as SYSTEM. Note this checks
+  ServiceDLL as well as ImagePath: services hosted inside svchost.exe put the
+  payload in a DLL, and a rule that only reads ImagePath sees "svchost.exe" and
+  misses the whole technique.
+  Requires the Services plugin CSV to have a spec -- with generic parsing these
+  fields are not addressable.
+scope:
+  artifact_type: [service, memory_service]
+match:
+  any:
+    - field: raw_data.ImagePath
+      contains_any: ["\\appdata\\", "\\temp\\", "\\programdata\\", "\\users\\",
+                     "\\perflogs\\", "\\$recycle.bin\\"]
+    - field: raw_data.ServiceDLL
+      contains_any: ["\\appdata\\", "\\temp\\", "\\programdata\\", "\\users\\"]
+exclude:
+  - field: raw_data.ImagePath
+    contains_any: ["\\program files\\", "\\program files (x86)\\",
+                   "\\windows\\system32\\", "\\windows\\syswow64\\",
+                   "\\systemroot\\", "\\??\\c:\\windows\\"]
+
+---
+id: MDF-0006
+title: Encoded or obfuscated PowerShell
+severity: critical
+score: 70
+attack: [T1059.001, T1027]
+description: >
+  -EncodedCommand takes base64. There is no benign administrative reason to
+  hide a command from the person reading the log. The regex requires 40+ base64
+  characters so that "-e" as an abbreviation of another parameter does not fire.
+scope:
+  artifact_type: [event_log, memory_cmdline, prefetch_execution, registry_,
+                  scheduled_task, service]
+match:
+  all:
+    - field: description
+      contains: powershell
+  any:
+    - field: description
+      regex: "(?i)\\s-(enc|encodedcommand|ec)\\s+[A-Za-z0-9+/=]{40,}"
+    - field: description
+      contains_any: ["frombase64string", "-nop -w hidden", "-windowstyle hidden",
+                     "downloadstring", "downloadfile", "iex(",
+                     "invoke-expression", "bypass -"]
+
+---
+
+id: MDF-0008
+title: Event log cleared
+severity: critical
+score: 70
+attack: [T1070.001]
+description: >
+  Security 1102 or System 104. Clearing a log is not an error condition; it is
+  an action someone chose to take, and it is one of the few events that is
+  almost never benign outside a documented maintenance window.
+scope:
+  artifact_type: [event_log]
+match:
+  any:
+      - all:
+          - field: raw_data.Channel
+            equals: Security
+          - field: raw_data.EventId
+            equals: "1102"
+
+      - all:
+          - field: raw_data.Channel
+            equals: System
+          - field: raw_data.EventId
+            equals: "104"
+          - field: raw_data.Provider
+            contains: Eventlog
+---
+id: MDF-0009
+title: Injected memory region with an MZ header
+severity: critical
+score: 70
+attack: [T1055.002]
+description: >
+  malfind found an executable, private, committed memory region. The MZ header
+  means a full PE was mapped there rather than shellcode -- reflective loading.
+  Requires memory acquisition; without it this rule can never fire, which
+  belongs in the report's limitations section.
+scope:
+  artifact_type: [memory_injection]
+match:
+  any:
+    - field: raw_data._enrich.mz_header
+      is_true: true
+
+---
+id: MDF-0010
+title: Executable or archive delivered by browser download
+severity: medium
+score: 25
+attack: [T1566.001]
+description: >
+  On its own this is weak -- people download installers. Scored low on purpose
+  so it supplies CONTEXT around higher-severity findings rather than competing
+  with them. It becomes strong only in combination, which is what the
+  download-then-execute correlation is for.
+scope:
+  artifact_type: [browser_download]
+match:
+  any:
+    - field: raw_data.path
+      regex: "(?i)\\.(exe|scr|js|jse|vbs|hta|ps1|iso|img|lnk|bat|cmd|zip|rar|7z)$"
+
+---
+
+id: MDF-0011
+title: Office or browser spawned a script interpreter
+severity: critical
+score: 80
+attack: [T1566.001, T1059.001, T1204.002]
+description: >
+  The phishing chain, in one event. A document application has no reason to
+  start PowerShell. No disk artifact can show this: Prefetch records that both
+  ran, only Sysmon records that one SPAWNED the other.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.Channel
+      contains: Sysmon
+    - field: raw_data.EventId
+      equals: "1"
+    - field: raw_data._enrich.payload.ParentImage
+      contains_any: ["\\winword.exe", "\\excel.exe", "\\powerpnt.exe",
+                     "\\outlook.exe", "\\msaccess.exe", "\\onenote.exe",
+                     "\\acrord32.exe", "\\wordpad.exe"]
+    - field: raw_data._enrich.payload.Image
+      contains_any: ["\\powershell.exe", "\\pwsh.exe", "\\cmd.exe",
+                     "\\wscript.exe", "\\cscript.exe", "\\mshta.exe",
+                     "\\rundll32.exe", "\\regsvr32.exe", "\\bitsadmin.exe"]
+
+---
+id: MDF-0012
+title: Remote thread created in another process
+severity: critical
+score: 80
+attack: [T1055]
+description: >
+  Sysmon EventID 8 -- one process creating a thread inside another, recorded
+  as it happened. MDF-0009 finds injection RESIDUE in a memory dump; this is
+  the act itself, with source, target and start address.
+  Legitimate uses exist (debuggers, some AV), which is what the exclusions
+  are for -- but the total count is usually small enough to read by hand.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.Channel
+      contains: Sysmon
+    - field: raw_data.EventId
+      equals: "8"
+exclude:
+  - field: raw_data._enrich.payload.SourceImage
+    contains_any: ["\\csrss.exe", "\\wininit.exe", "\\services.exe",
+                   "\\svchost.exe", "\\lsass.exe"]
+
+---
+id: MDF-0013
+title: Script interpreter or LOLBin resolved a DNS name
+severity: high
+score: 55
+attack: [T1071.004, T1105]
+description: >
+  Sysmon EventID 22 attributes DNS queries to the process that made them.
+  A browser resolving a domain is normal; powershell.exe, mshta.exe or
+  rundll32.exe doing it is command-and-control or a download stage.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.Channel
+      contains: Sysmon
+    - field: raw_data.EventId
+      equals: "22"
+    - field: raw_data._enrich.payload.Image
+      contains_any: ["\\powershell.exe", "\\pwsh.exe", "\\mshta.exe",
+                     "\\rundll32.exe", "\\regsvr32.exe", "\\certutil.exe",
+                     "\\bitsadmin.exe", "\\wscript.exe", "\\cscript.exe",
+                     "\\curl.exe", "\\wget.exe"]
+exclude:
+  # Microsoft's own telemetry and update endpoints
+  - field: raw_data._enrich.payload.QueryName
+    contains_any: ["microsoft.com", "windowsupdate.com", "msftconnecttest.com",
+                   "msedge.net", "office.net", "live.com"]
+
+---
+id: MDF-0014
+title: Encoded or hidden PowerShell with the full command line
+severity: critical
+score: 80
+attack: [T1059.001, T1027]
+description: >
+  MDF-0006 matches on the description string. This matches the ACTUAL
+  CommandLine field, so it catches arguments the description truncated, and
+  it records the parent process alongside.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.Channel
+      contains: Sysmon
+    - field: raw_data.EventId
+      equals: "1"
+  any:
+    - field: raw_data._enrich.payload.CommandLine
+      regex: "(?i)\\s-(enc|encodedcommand|ec)\\s+[A-Za-z0-9+/=]{40,}"
+    - field: raw_data._enrich.payload.CommandLine
+      contains_any: ["frombase64string", "-nop -w hidden", "-windowstyle hidden",
+                     "downloadstring", "downloadfile", "invoke-expression",
+                     "iex(", "-exec bypass", "-ep bypass",
+                     "[System.Convert]::", "invoke-webrequest"]
+
+---
+id: MDF-0015
+title: LOLBin invoked with a remote resource
+severity: high
+score: 60
+attack: [T1218.011, T1218.010, T1105]
+description: >
+  The Sysmon version of MDF-0002. Signed Microsoft binaries defeat naive
+  allow-listing, so the argument is the signal -- and here we have the real
+  argument rather than a truncated description.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.Channel
+      contains: Sysmon
+    - field: raw_data.EventId
+      equals: "1"
+    - field: raw_data._enrich.payload.Image
+      contains_any: ["\\rundll32.exe", "\\regsvr32.exe", "\\mshta.exe",
+                     "\\certutil.exe", "\\bitsadmin.exe", "\\wmic.exe",
+                     "\\installutil.exe", "\\msbuild.exe", "\\msiexec.exe"]
+  any:
+    - field: raw_data._enrich.payload.CommandLine
+      contains_any: ["http://", "https://", "\\\\", "javascript:",
+                     "scrobj.dll", "-urlcache", "-decode", "/transfer"]
+
+---
+id: MDF-0016
+title: Process executed from a user-writable staging directory
+severity: high
+score: 50
+attack: [T1204.002]
+description: >
+  The Sysmon equivalent of MDF-0001, but with the parent process and the
+  SHA-256 attached. Expect noise on a developer machine -- installers stage
+  in Temp constantly.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.Channel
+      contains: Sysmon
+    - field: raw_data.EventId
+      equals: "1"
+    - field: raw_data._enrich.payload.Image
+      contains_any: ["\\appdata\\local\\temp\\", "\\windows\\temp\\",
+                     "\\downloads\\", "\\users\\public\\", "\\programdata\\",
+                     "\\$recycle.bin\\", "\\perflogs\\"]
+exclude:
+  - field: raw_data._enrich.payload.Image
+    contains_any: ["\\programdata\\chocolatey\\", "\\programdata\\package cache\\",
+                   "\\temp\\chocolatey\\"]
+  # a signed Microsoft binary staging in Temp is an installer, not an intrusion
+  - field: raw_data._enrich.payload.Company
+    contains_any: ["Microsoft Corporation"]
+
+---
+id: MDF-0017
+title: Autorun registry value written by a live process
+severity: high
+score: 60
+attack: [T1547.001]
+description: >
+  MDF-0003 reads the registry hive and tells you a Run key EXISTS. This tells
+  you WHICH PROCESS WROTE IT and WHEN -- the difference between finding
+  persistence and understanding how it got there.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.Channel
+      contains: Sysmon
+    - field: raw_data.EventId
+      equals_any: ["12", "13", "14"]
+    - field: raw_data._enrich.payload.TargetObject
+      contains_any: ["\\CurrentVersion\\Run", "\\CurrentVersion\\RunOnce",
+                     "\\Winlogon\\Shell", "\\Winlogon\\Userinit",
+                     "\\Image File Execution Options\\",
+                     "\\CurrentControlSet\\Services\\"]
+exclude:
+  - field: raw_data._enrich.payload.Image
+    contains_any: ["\\svchost.exe", "\\services.exe", "\\TrustedInstaller.exe",
+                   "\\msiexec.exe", "\\TiWorker.exe"]
+
+---
+id: MDF-0018
+title: File written to a startup folder
+severity: high
+score: 60
+attack: [T1547.001]
+description: >
+  Sysmon EventID 11 attributes file writes to a process. Anything dropped
+  into a Startup folder runs at next logon.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.Channel
+      contains: Sysmon
+    - field: raw_data.EventId
+      equals: "11"
+    - field: raw_data._enrich.payload.TargetFilename
+      contains_any: ["\\Start Menu\\Programs\\Startup\\",
+                     "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\"]
+
+---
+id: MDF-0019
+title: Executable or script dropped into a staging directory
+severity: medium
+score: 35
+attack: [T1105]
+description: >
+  Scored medium on purpose: browsers and installers write to Temp constantly.
+  This is CONTEXT that becomes strong when it clusters with an execution
+  event for the same path.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.Channel
+      contains: Sysmon
+    - field: raw_data.EventId
+      equals: "11"
+    - field: raw_data._enrich.payload.TargetFilename
+      contains_any: ["\\appdata\\local\\temp\\", "\\windows\\temp\\",
+                     "\\users\\public\\", "\\programdata\\"]
+    - field: raw_data._enrich.payload.TargetFilename
+      regex: "(?i)\\.(exe|dll|ps1|bat|cmd|scr|vbs|js|hta|jar)$"
+exclude:
+  - field: raw_data._enrich.payload.Image
+    contains_any: ["\\chrome.exe", "\\msedge.exe", "\\firefox.exe",
+                   "\\msiexec.exe", "\\TiWorker.exe", "\\choco.exe"]
+
+---
+id: MDF-0020
+title: Network connection initiated by a script interpreter
+severity: high
+score: 55
+attack: [T1071.001]
+description: >
+  Sysmon EventID 3 attributes connections to a process. powershell.exe
+  reaching outbound is either administration or command-and-control.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.Channel
+      contains: Sysmon
+    - field: raw_data.EventId
+      equals: "3"
+    - field: raw_data._enrich.payload.Image
+      contains_any: ["\\powershell.exe", "\\pwsh.exe", "\\mshta.exe",
+                     "\\rundll32.exe", "\\regsvr32.exe", "\\certutil.exe",
+                     "\\wscript.exe", "\\cscript.exe"]
+exclude:
+  - field: raw_data._enrich.payload.DestinationIp
+    startswith_any: ["127.", "::1", "169.254."]
+
+---
+id: MDF-0021
+title: Executable or script written to a staging directory
+severity: high
+score: 50
+attack: [T1105, T1204.002]
+description: >
+  The USN journal records every filesystem change with a reason flag, so it
+  catches files that were created and DELETED before any other artifact could
+  record them -- an installer that ran and cleaned up leaves nothing in
+  Prefetch, but the journal still has the write.
+  This is the only rule that reads the largest artifact type in the database.
+  It will be noisy on a developer machine; tune with triage.py --suggest
+  before judging it.
+scope:
+  artifact_type: [usn_journal]
+match:
+  all:
+    - field: description
+      contains_any: ["\\appdata\\local\\temp\\", "\\windows\\temp\\",
+                     "\\users\\public\\", "\\downloads\\", "\\perflogs\\",
+                     "\\$recycle.bin\\"]
+    - field: description
+      regex: "(?i)\\.(exe|dll|ps1|bat|cmd|scr|vbs|js|jse|hta|pif|com)\\b"
+  any:
+    - field: raw_data.UpdateReasons
+      contains_any: ["FileCreate", "DataExtend", "RenameNewName"]
+exclude:
+  - field: description
+    contains_any: ["\\temp\\chocolatey\\", "\\packages\\", "\\windows\\temp\\mrt",
+                   "\\temp\\msedge", "\\temp\\{"]
+
+---
+id: MDF-0022
+title: Large outbound data volume from a single application
+severity: high
+score: 55
+attack: [T1030, T1048]
+description: >
+  SRUM records bytes sent and received per application per hour. A process
+  moving hundreds of megabytes outbound is either a backup, an update, or
+  exfiltration -- and SRUM is the best proxy for transfer volume available
+  from disk artifacts alone.
+  The threshold is deliberately high (500 MB) so this stays a lead worth
+  reading rather than a list of every browser session.
+scope:
+  artifact_type: [srum_network]
+match:
+  all:
+    - field: raw_data.BytesSent
+      gt: 524288000
+exclude:
+  - field: description
+    contains_any: ["onedrive", "dropbox", "googledrive", "backup",
+                   "msedge", "chrome.exe", "firefox.exe", "svchost",
+                   "windowsupdate", "teams", "steam"]
+
+---
+id: MDF-0023
+title: Shortcut file invoking a script interpreter
+severity: critical
+score: 75
+attack: [T1204.001, T1547.009]
+description: >
+  A .lnk whose target is powershell or cmd with arguments is a classic
+  phishing payload -- the icon says "document", the target runs a command.
+  LECmd extracts the arguments, which is where the payload lives.
+  Also catches a shortcut placed in a Startup folder, which is persistence.
+scope:
+  artifact_type: [lnk_file]
+match:
+  any:
+    - field: raw_data.Arguments
+      contains_any: ["powershell", "-enc", "-nop", "cmd.exe /c", "mshta",
+                     "rundll32", "javascript:", "http://", "https://",
+                     "certutil", "bitsadmin", "wscript", "cscript"]
+    - field: description
+      contains_any: ["\\start menu\\programs\\startup\\"]
+
+---
+id: MDF-0024
+title: Executable or log file sent to the Recycle Bin
+severity: medium
+score: 40
+attack: [T1070.004]
+description: >
+  $I files record the ORIGINAL PATH and deletion time even after the content
+  is gone. Deleting an executable or a log is cleanup; deleting a document is
+  ordinary use, which is why the extension filter matters.
+scope:
+  artifact_type: [recycle_bin]
+match:
+  any:
+    - field: description
+      regex: "(?i)\\.(exe|dll|ps1|bat|cmd|scr|vbs|js|hta|evtx|log)\\b"
+    - field: raw_data.FileName
+      contains_any: ["\\windows\\system32\\winevt\\", "\\temp\\", "\\downloads\\"]
+
+---
+# MiniDFIR -- Tier 1 Windows rules (MDF-0025..0036).
+#
+# Selected on three filters: FREQUENCY in real intrusions, DETECTABLE with the
+# telemetry this framework collects, and LOW FALSE-POSITIVE potential.
+#
+# EVERY CONDITION HERE IS A STARTING POINT, NOT A FINISHED RULE.
+# Source the real conditions from SigmaHQ:
+#
+#     git clone --depth 1 https://github.com/SigmaHQ/sigma C:\dl\sigma
+#     Select-String -Path C:\dl\sigma\rules\**\*.yml -Pattern "attack.t1490" -List
+#
+# and read each rule's `falsepositives:` block -- that becomes your exclude:.
+# Sigma rules are the most complete public corpus of per-technique detection
+# conditions, and the framework does not need to EXECUTE Sigma to LEARN from it.
+#
+# THE STRUCTURAL LESSON, applied throughout this file:
+# Sigma pairs `selection_img` (WHO) with `selection_cli` (WHAT). Two
+# independent conditions, not one. That pairing is why SigmaHQ rules have
+# workable false-positive rates, and why MDF-0019 in its original form -- a
+# single path condition -- fired 391 times on a developer workstation.
+#
+# TELEMETRY PREREQUISITES: several rules below need Sysmon events that a
+# default config does not log. Verify before trusting a zero result:
+#     EventID 7   Image Load       -> MDF-0032 (DLL side-loading)
+#     EventID 10  ProcessAccess    -> MDF-0026 (LSASS access)
+# and Security-log auditing for 4624 / 4720 / 4769 -> MDF-0028, 0033, 0036.
+# `main.py gaps` reports which telemetry classes are actually present.
+
+id: MDF-0025
+title: Shadow copies or recovery options destroyed
+severity: critical
+score: 90
+attack: [T1490]
+description: >
+  Deleting volume shadow copies or disabling Windows recovery is the
+  ransomware pre-encryption step and has essentially no benign use on an
+  endpoint. Highest confidence-per-line in the Windows set.
+
+  Written after the data-component gap analysis showed T1490 needs only
+  command_execution and process_creation -- both available via Sysmon
+  EventID 1 -- and that no YAML rule targeted it. The memory YARA rule
+  covers it, but only when a dump was taken.
+scope:
+  artifact_type: [event_log, memory_cmdline]
+match:
+  any:
+    - field: raw_data._enrich.payload.CommandLine
+      contains_any: ["vssadmin delete shadows", "vssadmin.exe delete shadows",
+                     "shadowcopy delete", "win32_shadowcopy",
+                     "delete shadows /all", "shadowstorage",
+                     "wbadmin delete catalog", "wbadmin delete systemstatebackup",
+                     "recoveryenabled no", "bootstatuspolicy ignoreallfailures",
+                     "delete catalog -quiet"]
+    - field: description
+      contains_any: ["vssadmin delete shadows", "wbadmin delete catalog"]
+
+---
+id: MDF-0026
+title: LSASS process memory accessed or dumped
+severity: critical
+score: 90
+attack: [T1003.001]
+description: >
+  Reading LSASS is credential theft. comsvcs.dll MiniDump is the
+  living-off-the-land variant needing no external tool; procdump -ma is the
+  signed-binary one.
+
+  NEEDS Sysmon EventID 10 (ProcessAccess) for the access half; the
+  CommandLine half works from EventID 1 alone. If EventID 10 is absent from
+  your Sysmon config this rule catches only the tooling, not the access.
+scope:
+  artifact_type: [event_log, memory_cmdline]
+match:
+  any:
+    - field: raw_data._enrich.payload.CommandLine
+      contains_any: ["comsvcs.dll, minidump", "comsvcs.dll minidump",
+                     "-ma lsass", "procdump.exe -ma", "lsass.dmp",
+                     "sekurlsa::", "lsadump::", "rundll32.exe comsvcs"]
+    - field: raw_data._enrich.payload.TargetImage
+      endswith_any: ["\\lsass.exe"]
+exclude:
+  # Defender, the crash reporter and Task Manager legitimately open LSASS
+  - field: raw_data._enrich.payload.SourceImage
+    contains_any: ["\\MsMpEng.exe", "\\WerFault.exe", "\\csrss.exe",
+                   "\\wininit.exe", "\\taskmgr.exe", "\\SenseIR.exe",
+                   "\\MpDefenderCoreService.exe"]
+
+---
+id: MDF-0027
+title: WMI used for process creation or remote execution
+severity: high
+score: 65
+attack: [T1047]
+description: >
+  wmic process call create is a standard remote-execution and
+  living-off-the-land technique. Administrators use WMI legitimately, so the
+  signal is the ACTION (process creation, remote node) rather than WMI itself.
+scope:
+  artifact_type: [event_log, memory_cmdline]
+match:
+  all:
+    - field: raw_data._enrich.payload.Image
+      endswith_any: ["\\wmic.exe", "\\WmiPrvSE.exe", "\\powershell.exe",
+                     "\\pwsh.exe"]
+  any:
+    - field: raw_data._enrich.payload.CommandLine
+      contains_any: ["process call create", "/node:", "Invoke-WmiMethod",
+                     "Invoke-CimMethod", "win32_process", "-ComputerName"]
+exclude:
+  - field: raw_data._enrich.payload.ParentImage
+    contains_any: ["\\SenseIR.exe", "\\MsMpEng.exe"]
+
+---
+id: MDF-0028
+title: Interactive or remote-desktop logon
+severity: medium
+score: 35
+attack: [T1021.001, T1078]
+description: >
+  Security EventID 4624 with LogonType 10 (RemoteInteractive) is RDP -- the
+  most common lateral-movement method in real intrusions.
+
+  Scored MEDIUM on purpose: RDP is how most people administer Windows. It
+  becomes a finding when the source address is unexpected, or when it
+  clusters with execution or persistence on the same host, which cluster.py
+  computes. Never act on this alone.
+
+  NEEDS Security-log auditing for 4624. Verify it is present before trusting
+  a zero result.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.EventId
+      equals: "4624"
+    - field: raw_data._enrich.payload.LogonType
+      equals_any: ["10", "7"]
+exclude:
+  - field: raw_data._enrich.payload.IpAddress
+    startswith_any: ["127.", "-", "::1"]
+
+---
+id: MDF-0029
+title: Security service or backup stopped
+severity: critical
+score: 80
+attack: [T1489, T1562.001]
+description: >
+  Ransomware stops antivirus, backup agents and database services before
+  encrypting, so files are unlocked and recovery is unavailable. Stopping a
+  security service is rarely an administrative accident.
+scope:
+  artifact_type: [event_log, memory_cmdline]
+match:
+  all:
+    - field: raw_data._enrich.payload.CommandLine
+      contains_any: ["net stop", "sc stop", "sc.exe stop", "Stop-Service",
+                     "taskkill /f", "taskkill.exe /f"]
+  any:
+    - field: raw_data._enrich.payload.CommandLine
+      contains_any: ["windefend", "sense", "sophos", "mcafee", "symantec",
+                     "sepmasterservice", "crowdstrike", "csfalcon",
+                     "sqlserver", "msexchange", "veeam", "backup",
+                     "acronis", "vss", "sqlwriter", "memtas", "mepocs"]
+
+---
+id: MDF-0030
+title: Security software enumerated
+severity: medium
+score: 40
+attack: [T1518.001]
+description: >
+  Attackers check which defences are present before acting, and the query
+  itself is the tell. Scored medium because inventory tooling does this too;
+  it earns weight beside an execution or persistence finding on the same
+  process.
+scope:
+  artifact_type: [event_log, memory_cmdline]
+match:
+  any:
+    - field: raw_data._enrich.payload.CommandLine
+      contains_any: ["Get-MpComputerStatus", "Get-MpPreference",
+                     "AntiVirusProduct", "FirewallProduct",
+                     "root\\SecurityCenter2", "sc query windefend",
+                     "tasklist /svc", "netsh advfirewall show"]
+exclude:
+  - field: raw_data._enrich.payload.Image
+    contains_any: ["\\MsMpEng.exe", "\\MpCmdRun.exe", "\\SenseIR.exe"]
+
+---
+id: MDF-0031
+title: User Account Control bypass via a known auto-elevating binary
+severity: critical
+score: 85
+attack: [T1548.002]
+description: >
+  fodhelper.exe, computerdefaults.exe and sdclt.exe auto-elevate without a
+  prompt and read a hijackable registry key. A CHILD PROCESS under one of
+  them is essentially always a UAC bypass -- these binaries do not normally
+  spawn anything.
+
+  Very low false-positive rate, which is why it is scored critical on a
+  parent-process condition alone.
+scope:
+  artifact_type: [event_log]
+match:
+  any:
+    - field: raw_data._enrich.payload.ParentImage
+      endswith_any: ["\\fodhelper.exe", "\\computerdefaults.exe",
+                     "\\sdclt.exe", "\\slui.exe", "\\eventvwr.exe",
+                     "\\wsreset.exe"]
+    - field: raw_data._enrich.payload.TargetObject
+      contains_any: ["\\ms-settings\\shell\\open\\command",
+                     "\\mscfile\\shell\\open\\command",
+                     "\\Folder\\shell\\open\\command",
+                     "\\exefile\\shell\\open\\command"]
+
+---
+id: MDF-0032
+title: Signed binary loading a DLL from a user-writable path
+severity: critical
+score: 80
+attack: [T1574.002, T1574.001]
+description: >
+  DLL side-loading: a legitimate signed executable is placed alongside a
+  malicious DLL it will load by name. Extremely common and rarely detected,
+  because the PROCESS is signed and legitimate -- the signal is WHERE the
+  module came from.
+
+  NEEDS Sysmon EventID 7 (Image Load), which a default config does NOT log
+  and which is high-volume when enabled. If EventID 7 is absent this rule
+  cannot fire, and `main.py gaps` will show module_load as unavailable.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.EventId
+      equals: "7"
+    - field: raw_data._enrich.payload.ImageLoaded
+      contains_any: ["\\appdata\\local\\temp\\", "\\windows\\temp\\",
+                     "\\users\\public\\", "\\programdata\\",
+                     "\\downloads\\", "\\perflogs\\", "\\$recycle.bin\\"]
+exclude:
+  # installers and package managers legitimately load from staging paths
+  - field: raw_data._enrich.payload.Image
+    contains_any: ["\\msiexec.exe", "\\TiWorker.exe", "\\setup.exe",
+                   "\\vcredist", "\\choco.exe", "\\python", "\\node.exe"]
+  - field: raw_data._enrich.payload.ImageLoaded
+    contains_any: ["\\programdata\\chocolatey\\", "\\programdata\\package cache\\"]
+
+---
+id: MDF-0033
+title: Local user account created or added to a privileged group
+severity: critical
+score: 80
+attack: [T1136.001, T1098]
+description: >
+  A new account, or an existing one added to Administrators, is durable
+  access that survives password resets and reboots.
+
+  Security EventID 4720 (account created) and 4732 (added to a group) are the
+  authoritative records; the CommandLine form catches it where auditing is
+  not configured.
+scope:
+  artifact_type: [event_log, memory_cmdline]
+match:
+  any:
+      - all:
+          - field: raw_data.Channel
+            equals: Security
+          - field: raw_data.EventId
+            equals_any:
+              - "4720"
+              - "4732"
+              - "4728"
+
+      - field: raw_data._enrich.payload.CommandLine
+        contains_any:
+          - "net user /add"
+          - "net.exe user /add"
+          - "net localgroup administrators"
+          - "New-LocalUser"
+          - "Add-LocalGroupMember"
+          - 'net group "domain admins" /add'
+---
+id: MDF-0034
+title: Host or domain reconnaissance from a single process
+severity: medium
+score: 40
+attack: [T1018, T1087.002, T1482]
+description: >
+  Enumeration. Individually ordinary -- administrators run all of these --
+  so this is CONTEXT that raises a process's aggregate score rather than an
+  alert. It becomes meaningful when the same PID also triggers an execution
+  or persistence rule, which is what cluster.py's cross-rule scoring
+  surfaces.
+
+  Deliberately NOT including whoami, hostname or systeminfo alone: those run
+  thousands of times legitimately and would reproduce the MDF-0019 fault of
+  matching normal computing.
+scope:
+  artifact_type: [event_log, memory_cmdline]
+match:
+  any:
+    - field: raw_data._enrich.payload.CommandLine
+      contains_any: ["net group \"domain admins\"", "net localgroup administrators",
+                     "nltest /domain_trusts", "nltest /dclist",
+                     "Get-ADComputer", "Get-ADUser", "Get-DomainUser",
+                     "Get-NetComputer", "adfind.exe", "whoami /all",
+                     "whoami /priv", "net view /domain", "dsquery ",
+                     "Get-DomainController"]
+exclude:
+  - field: raw_data._enrich.payload.Image
+    contains_any: ["\\MsMpEng.exe", "\\SenseIR.exe", "\\gpresult.exe"]
+
+---
+id: MDF-0035
+title: File delivered inside a container that defeats Mark-of-the-Web
+severity: high
+score: 60
+attack: [T1553.005, T1204.002]
+description: >
+  Files downloaded from the internet carry a Zone.Identifier stream, and
+  SmartScreen and Office use it to warn. Content extracted from an ISO, IMG
+  or VHD does NOT inherit it -- which is why phishing shifted to those
+  containers.
+
+  The signal is an executable or script appearing under a mounted volume
+  path, or an ISO landing in Downloads.
+scope:
+  artifact_type: [event_log, usn_journal, browser_download]
+match:
+  any:
+    - field: raw_data._enrich.payload.TargetFilename
+      regex: "(?i)\\.(iso|img|vhd|vhdx)$"
+    - field: raw_data.path
+      regex: "(?i)\\.(iso|img|vhd|vhdx)$"
+    - field: description
+      regex: "(?i)\\.(iso|img|vhd|vhdx)\\b"
+exclude:
+  - field: description
+    contains_any: ["\\windows\\", "\\program files\\", "installer",
+                   "\\vmware\\", "\\virtualbox\\"]
+
+---
+id: MDF-0036
+title: Executable written to a removable device path
+severity: high
+score: 55
+attack: [T1091, T1052.001]
+description: >
+  Removable media as an initial-access or exfiltration route. USB registry
+  artifacts were already being collected and NO rule read them -- surfaced by
+  the data-component gap analysis, which showed registry_modification
+  telemetry present with nothing consuming it for T1091.
+scope:
+  artifact_type: [event_log, usn_journal, registry_devices, unparsed_usb]
+match:
+  any:
+    - field: raw_data._enrich.payload.TargetFilename
+      regex: "(?i)^[d-z]:\\\\[^\\\\]*\\.(exe|dll|ps1|bat|cmd|scr|vbs|lnk)$"
+    - field: description
+      regex: "(?i)\\b(usbstor|removable)\\b"
+
+---
+# MiniDFIR -- Tier 2 Windows rules (MDF-0037..0046).
+#
+# Lower frequency than Tier 1, or higher false-positive potential, but each
+# covers a technique with a real detection story. Add after Tier 1 is tuned.
+#
+# As with Tier 1: source the real conditions from SigmaHQ and copy its
+# `falsepositives:` block into exclude:.
+
+id: MDF-0037
+title: Accessibility binary replaced or hijacked
+severity: critical
+score: 85
+attack: [T1546.008]
+description: >
+  sethc.exe (Sticky Keys) and utilman.exe run as SYSTEM from the logon
+  screen, before anyone authenticates. Replacing one, or pointing its Image
+  File Execution Options debugger at cmd.exe, is a pre-authentication
+  backdoor -- press Shift five times at the lock screen and get a SYSTEM
+  shell.
+
+  Old, well known, and still used because it survives password resets.
+scope:
+  artifact_type: [event_log, usn_journal, mft_file]
+match:
+  any:
+    - field: raw_data._enrich.payload.TargetObject
+      contains_any: ["\\image file execution options\\sethc.exe",
+                     "\\image file execution options\\utilman.exe",
+                     "\\image file execution options\\osk.exe",
+                     "\\image file execution options\\magnify.exe",
+                     "\\image file execution options\\narrator.exe",
+                     "\\image file execution options\\displayswitch.exe"]
+    - field: raw_data._enrich.payload.TargetFilename
+      contains_any: ["\\system32\\sethc.exe", "\\system32\\utilman.exe",
+                     "\\system32\\osk.exe", "\\system32\\magnify.exe"]
+exclude:
+  - field: raw_data._enrich.payload.Image
+    contains_any: ["\\TiWorker.exe", "\\TrustedInstaller.exe", "\\msiexec.exe"]
+
+---
+id: MDF-0038
+title: Image File Execution Options debugger set
+severity: critical
+score: 80
+attack: [T1546.012]
+description: >
+  An IFEO Debugger value makes Windows launch the named debugger INSTEAD of
+  the target executable. Legitimate for actual debugging, and almost never
+  seen outside it -- a Debugger key on a system binary is persistence with
+  execution attached.
+scope:
+  artifact_type: [event_log, registry_]
+match:
+  all:
+      - field: raw_data._enrich.payload.TargetObject
+        contains: '\image file execution options\'
+
+      - any:
+          - field: raw_data._enrich.payload.TargetObject
+            contains_any:
+              - '\debugger'
+              - '\globalflag'
+              - '\reportingmode'
+              - '\monitorprocess'
+
+---
+id: MDF-0039
+title: BITS used to transfer a file
+severity: high
+score: 60
+attack: [T1197, T1105]
+description: >
+  The Background Intelligent Transfer Service downloads in the background,
+  survives reboots and logoffs, and is a signed Microsoft component -- which
+  is why it is used to stage payloads. Windows Update uses it legitimately,
+  hence the exclusions.
+scope:
+  artifact_type: [event_log, memory_cmdline]
+match:
+  any:
+    - field: raw_data._enrich.payload.CommandLine
+      contains_any: ["bitsadmin /transfer", "bitsadmin.exe /transfer",
+                     "bitsadmin /create", "Start-BitsTransfer",
+                     "/addfile http", "/setnotifycmdline"]
+exclude:
+  - field: raw_data._enrich.payload.CommandLine
+    contains_any: ["windowsupdate.com", "microsoft.com", "msedge",
+                   "delivery.mp.microsoft"]
+
+---
+id: MDF-0040
+title: File written to an NTFS alternate data stream
+severity: high
+score: 65
+attack: [T1564.004]
+description: >
+  An alternate data stream stores content that does not appear in a
+  directory listing and does not affect the file's apparent size. Used to
+  hide payloads inside an innocuous file.
+
+  A colon after the drive-letter position in a filename is the tell.
+  Zone.Identifier is the ordinary case and is excluded.
+scope:
+  artifact_type: [event_log, usn_journal]
+match:
+  any:
+    - field: raw_data._enrich.payload.TargetFilename
+      regex: "(?i)^[a-z]:\\\\.+:[^\\\\:]+$"
+    - field: raw_data._enrich.payload.CommandLine
+      regex: "(?i)(type|echo|Set-Content|Add-Content)\\s+.*>\\s*[^\\s]+:[^\\s\\\\]+"
+exclude:
+  - field: raw_data._enrich.payload.TargetFilename
+    contains_any: [":Zone.Identifier", ":SmartScreen", ":$DATA",
+                   ":favicon", ":OECustomProperty"]
+
+---
+id: MDF-0041
+title: Registry persistence key modified by a live process
+severity: high
+score: 60
+attack: [T1112, T1547]
+description: >
+  Broader than MDF-0017, covering persistence keys beyond Run. Sysmon
+  EventID 12/13/14 record WHICH PROCESS made the change, which the registry
+  hive itself cannot tell you.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.EventId
+      equals_any: ["12", "13", "14"]
+    - field: raw_data._enrich.payload.TargetObject
+      contains_any: ["\\currentversion\\runonce", "\\currentversion\\runservices",
+                     "\\winlogon\\shell", "\\winlogon\\userinit",
+                     "\\winlogon\\taskman", "\\currentversion\\policies\\explorer\\run",
+                     "\\appinit_dlls", "\\appcertdlls",
+                     "\\session manager\\bootexecute",
+                     "\\safeboot\\", "\\currentcontrolset\\services\\"]
+exclude:
+  - field: raw_data._enrich.payload.Image
+    contains_any: ["\\svchost.exe", "\\services.exe", "\\TrustedInstaller.exe",
+                   "\\TiWorker.exe", "\\msiexec.exe", "\\poqexec.exe"]
+
+---
+id: MDF-0042
+title: Chained command shell execution
+severity: medium
+score: 40
+attack: [T1059.003]
+description: >
+  cmd /c with chained operators, or invoked by a process that has no reason
+  to spawn a shell. Scored medium: scripts and installers use cmd /c
+  constantly. It earns weight through the PARENT, which is why the parent
+  condition is required rather than optional.
+scope:
+  artifact_type: [event_log, memory_cmdline]
+match:
+  all:
+    - field: raw_data._enrich.payload.Image
+      endswith_any: ["\\cmd.exe"]
+    - field: raw_data._enrich.payload.ParentImage
+      contains_any: ["\\winword.exe", "\\excel.exe", "\\powerpnt.exe",
+                     "\\outlook.exe", "\\acrord32.exe", "\\mshta.exe",
+                     "\\wscript.exe", "\\cscript.exe", "\\rundll32.exe",
+                     "\\regsvr32.exe", "\\w3wp.exe", "\\httpd.exe",
+                     "\\tomcat", "\\sqlservr.exe"]
+
+---
+id: MDF-0043
+title: Network logon without an interactive session
+severity: medium
+score: 40
+attack: [T1550.002, T1021.002]
+description: >
+  Security EventID 4624 LogonType 3 is a network logon -- SMB, WMI, remote
+  service control. Normal in any domain, which is why this is CONTEXT.
+
+  It becomes a finding when the authentication package is NTLM on a Kerberos
+  domain, or when it clusters with execution on the destination host.
+
+  NEEDS Security-log auditing for 4624.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.EventId
+      equals: "4624"
+    - field: raw_data._enrich.payload.LogonType
+      equals: "3"
+  any:
+    - field: raw_data._enrich.payload.AuthenticationPackageName
+      contains: NTLM
+    - field: raw_data._enrich.payload.LogonProcessName
+      contains_any: ["NtLmSsp", "seclogo"]
+exclude:
+  - field: raw_data._enrich.payload.TargetUserName
+    endswith_any: ["$", "ANONYMOUS LOGON"]
+
+---
+id: MDF-0044
+title: Kerberos service ticket requested with weak encryption
+severity: high
+score: 65
+attack: [T1558.003]
+description: >
+  Kerberoasting: request service tickets, then crack them offline for the
+  service account password. Security EventID 4769 with encryption type 0x17
+  (RC4) is the signature -- modern clients request AES, so RC4 requests are
+  either legacy systems or an attacker forcing a crackable ticket.
+
+  NEEDS Kerberos service-ticket auditing, and only produces events on a
+  domain controller.
+scope:
+  artifact_type: [event_log]
+match:
+  all:
+    - field: raw_data.EventId
+      equals: "4769"
+    - field: raw_data._enrich.payload.TicketEncryptionType
+      equals_any: ["0x17", "0x18", "23"]
+exclude:
+  - field: raw_data._enrich.payload.ServiceName
+    endswith_any: ["$", "krbtgt"]
+
+---
+id: MDF-0045
+title: Mass file modification consistent with encryption
+severity: critical
+score: 85
+attack: [T1486]
+description: >
+  Ransomware rewrites and renames thousands of files in minutes. The USN
+  journal records every one, so the SHAPE of the activity -- volume in a
+  short window -- is the signal rather than any individual event.
+
+  This rule matches known ransomware extensions on a filesystem event. The
+  VOLUME test needs a correlation, not a rule: see execution_bursts() in
+  correlate.py, which is the same shape of question.
+scope:
+  artifact_type: [usn_journal, event_log, mft_file]
+match:
+  any:
+    - field: description
+      regex: "(?i)\\.(locked|encrypted|crypted|crypt|enc|lockbit|conti|ryuk|revil|makop|phobos|djvu|wncry|onion)$"
+    - field: description
+      contains_any: ["readme_to_restore", "how_to_decrypt", "recover_files",
+                     "_readme.txt", "restore-my-files", "decrypt_instruction"]
+    - field: raw_data._enrich.payload.TargetFilename
+      regex: "(?i)\\.(locked|encrypted|lockbit|conti|ryuk|revil)$"
+
+---
+id: MDF-0046
+title: Removable device connected
+severity: low
+score: 20
+attack: [T1091, T1200]
+description: >
+  USB device history from the registry. CONTEXT, not an alert -- people plug
+  in drives. It matters when an execution or file-creation finding traces to
+  the same volume, which is why the score is low and the rule is broad.
+
+  Included because USB artifacts were already being collected and NO rule
+  read them, which the data-component gap analysis surfaced.
+scope:
+  artifact_type: [registry_devices, unparsed_usb, registry_]
+match:
+  any:
+    - field: raw_data.KeyPath
+      contains_any: ["\\usbstor\\", "\\usb\\vid_", "\\mounteddevices"]
+    - field: description
+      regex: "(?i)\\b(usbstor|usb\\\\vid_)"

@@ -1,0 +1,442 @@
+
+id: MDL-0001
+title: ld.so.preload present
+severity: critical
+score: 80
+attack: [T1574.006]
+description: >
+  /etc/ld.so.preload forces a shared object into every dynamically linked
+  process on the box. Almost nothing legitimate uses it. Its presence alone is
+  close to conclusive for a userland rootkit.
+scope:
+  artifact_type: [file_entry]
+match:
+  any:
+    - field: raw_data.path
+      contains_any: ["/etc/ld.so.preload"]
+
+---
+id: MDL-0002
+title: Cron job downloading and executing remote content
+severity: critical
+score: 70
+attack: [T1053.003, T1059.004]
+scope:
+  artifact_type: [cron_job]
+match:
+  any:
+    - field: raw_data.command
+      contains_any: ["curl", "wget", "|bash", "| bash", "|sh", "| sh",
+                     "base64 -d", "python -c", "nc ", "/dev/tcp/"]
+
+---
+id: MDL-0003
+title: systemd unit executing from a user-writable or temporary path
+severity: high
+score: 55
+attack: [T1543.002]
+description: >
+  Distribution units live under /usr/bin, /usr/sbin or /usr/lib. A unit whose
+  ExecStart points at /tmp, /dev/shm or a home directory was not installed by
+  a package manager.
+scope:
+  artifact_type: [systemd_unit]
+match:
+  any:
+    - field: raw_data.exec_start
+      contains_any: ["/tmp/", "/dev/shm/", "/var/tmp/", "/home/", "/root/",
+                     "curl", "wget", "base64", "/dev/tcp/"]
+exclude:
+  - field: raw_data.exec_start
+    contains_any: ["/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/libexec/"]
+
+---
+id: MDL-0004
+title: Suspicious shell history command
+severity: high
+score: 50
+attack: [T1059.004, T1070.003]
+description: >
+  History clearing, reverse shells, and credential file access. Note that
+  history is trivially editable by the attacker, so absence proves nothing --
+  but presence is still evidence.
+scope:
+  artifact_type: [shell_history]
+match:
+  any:
+    - field: raw_data.command
+      contains_any: ["/dev/tcp/", "nc -e", "ncat -e", "bash -i >&",
+                     "history -c", "unset histfile", "rm ~/.bash_history",
+                     "chattr -i", "shred ", "/etc/shadow", "id_rsa",
+                     "chmod +s", "setcap ", "base64 -d"]
+    - field: raw_data.command
+      regex: "(?i)(curl|wget)\\s+\\S+\\s*\\|\\s*(bash|sh|python)"
+
+---
+id: MDL-0005
+title: SUID or SGID binary outside standard system paths
+severity: high
+score: 55
+attack: [T1548.001]
+scope:
+  artifact_type: [file_entry]
+match:
+  all:
+    - field: raw_data.mode
+      regex: "^-.{2}s|^-.{5}s"
+  any:
+    - field: raw_data.path
+      contains_any: ["/tmp/", "/dev/shm/", "/var/tmp/", "/home/"]
+
+---
+id: MDL-0006
+title: SSH authorized_keys modified for a privileged account
+severity: high
+score: 55
+attack: [T1098.004]
+description: >
+  Appending a key to authorized_keys is the most durable and least noisy Linux
+  persistence there is. It survives password changes and leaves no auth.log
+  entry at the time it is added.
+scope:
+  artifact_type: [ssh_authorized_key]
+match:
+  any:
+    - field: raw_data.user
+      equals_any: ["root"]
+    - field: raw_data.options
+      contains_any: ["command=", "no-pty"]
+
+---
+id: MDL-0007
+title: Account with UID 0 that is not root
+severity: critical
+score: 70
+attack: [T1136.001]
+scope:
+  artifact_type: [user_account]
+match:
+  all:
+    - field: raw_data.uid
+      equals: "0"
+  any:
+    - field: raw_data.user
+      regex: "^(?!root$).+"
+
+---
+id: MDL-0008
+title: Successful SSH login as root
+severity: medium
+score: 30
+attack: [T1078.003]
+description: >
+  Not malicious on its own -- many environments still permit it. Scored low so
+  it provides context around higher-severity findings rather than noise.
+scope:
+  artifact_type: [auth_log]
+match:
+  all:
+    - field: raw_data.event
+      equals: "ssh_login_success"
+    - field: raw_data.line
+      contains: "for root from"
+
+---
+# Rules for the auditd / package / journal artifact types.
+# Append to rules/detection/linux_core.yaml, or drop in as its own file.
+
+id: MDL-0009
+title: auditd recorded a download piped into a shell
+severity: critical
+score: 75
+attack: [T1059.004, T1105]
+description: >
+  auditd's EXECVE gives the FULL command line, which shell history does not
+  reliably provide and which an attacker cannot edit after the fact. This is
+  the strongest execution evidence available on Linux.
+scope:
+  artifact_type: [auditd]
+match:
+  any:
+    - field: raw_data.cmdline
+      regex: "(?i)(curl|wget)\\s+[^|]*\\|\\s*(bash|sh|python|perl)"
+    - field: raw_data.cmdline
+      contains_any: ["/dev/tcp/", "nc -e", "ncat -e", "bash -i >&",
+                     "base64 -d", "chmod +s", "setcap "]
+
+---
+id: MDL-0010
+title: auditd shows privilege escalation to root
+severity: high
+score: 45
+attack: [T1548.003]
+description: >
+  auid is the ORIGINAL login uid and survives su and sudo. auid non-root with
+  uid 0 means an unprivileged user is now running as root. Normal for
+  administrators, so scored as context rather than an alert -- it becomes
+  interesting when it clusters with other findings.
+scope:
+  artifact_type: [auditd]
+match:
+  all:
+    - field: raw_data.uid
+      equals: "0"
+  any:
+    - field: raw_data.auid
+      regex: "^(?!0$|4294967295$|-1$)\\d+$"
+exclude:
+  - field: raw_data.exe
+    contains_any: ["/usr/lib/systemd/", "/usr/sbin/cron", "/usr/sbin/sshd"]
+
+---
+id: MDL-0011
+title: auditd recorded access to a credential file
+severity: high
+score: 50
+attack: [T1003.008]
+scope:
+  artifact_type: [auditd]
+match:
+  any:
+    - field: raw_data.name
+      contains_any: ["/etc/shadow", "/etc/gshadow", "/root/.ssh/id_",
+                     "/etc/sudoers"]
+    - field: raw_data.cmdline
+      contains_any: ["/etc/shadow", "id_rsa", "id_ed25519"]
+exclude:
+  - field: raw_data.exe
+    contains_any: ["/usr/sbin/unix_chkpwd", "/usr/bin/passwd", "/usr/sbin/sshd"]
+
+---
+id: MDL-0012
+title: Attack tooling installed by the package manager
+severity: high
+score: 50
+attack: [T1588.002, T1105]
+description: >
+  Not malware -- these are legitimate tools that appear on a compromised host
+  far more often than on a normal one. On a pentest box or an admin's
+  workstation this is expected, which is what the exclusion note is for.
+  Package logs also tell you WHO installed it and WHEN, via apt's Requested-By.
+scope:
+  artifact_type: [package_event]
+match:
+  all:
+    - field: raw_data.action
+      contains_any: ["install", "installed"]
+  any:
+    - field: description
+      contains_any: ["netcat", "ncat", " nmap", "masscan", "socat", "hydra",
+                     "john", "hashcat", "sqlmap", "metasploit", "chisel",
+                     "proxychains", "tcpdump", "nikto"]
+
+---
+id: MDL-0013
+title: systemd started a unit from a temporary directory
+severity: high
+score: 55
+attack: [T1543.002]
+description: >
+  Catches the RUNTIME event, where MDL-0003 catches the unit FILE on disk.
+  Both matter: an attacker can start a transient unit that never writes a
+  file, and a unit file can exist without ever having run.
+scope:
+  artifact_type: [journal]
+match:
+  all:
+    - field: raw_data.unit
+      contains: systemd
+  any:
+    - field: raw_data.message
+      contains_any: ["/tmp/", "/dev/shm/", "/var/tmp/"]
+    - field: raw_data.cmdline
+      contains_any: ["/tmp/", "/dev/shm/", "/var/tmp/"]
+
+---
+id: MDL-0013
+title: systemd started a unit from a temporary directory
+severity: high
+score: 55
+attack: [T1543.002]
+description: >
+  Catches the RUNTIME event, where MDL-0003 catches the unit file on disk. Both
+  matter: an attacker can start a transient unit that never writes a file, and
+  a unit file can exist without ever having run.
+scope:
+  artifact_type: [journal]
+match:
+  all:
+    - field: raw_data.unit
+      contains: systemd
+  any:
+    - field: raw_data.message
+      contains_any: ["/tmp/", "/dev/shm/", "/var/tmp/"]
+    - field: raw_data.cmdline
+      contains_any: ["/tmp/", "/dev/shm/", "/var/tmp/"]
+# Rules for the persistence_file / trash_item / system_identity types.
+
+id: MDL-0014
+title: Shell startup file executes remote content
+severity: critical
+score: 70
+attack: [T1546.004]
+description: >
+  .bashrc, .profile and /etc/profile.d/* run on every interactive login. A
+  curl-to-shell line here re-establishes access every time the user logs in,
+  and it survives password changes and key rotation.
+scope:
+  artifact_type: [persistence_file]
+match:
+  all:
+    - field: raw_data.kind
+      equals_any: [shell_startup, x_startup, boot_script, desktop_autostart]
+  any:
+    - field: raw_data.content
+      regex: "(?i)(curl|wget)\\s+[^\\n]*\\|\\s*(bash|sh|python)"
+    - field: raw_data.content
+      contains_any: ["/dev/tcp/", "base64 -d", "nc -e", "ncat -e",
+                     "/tmp/", "/dev/shm/", "/var/tmp/", "eval $("]
+
+---
+id: MDL-0015
+title: Passwordless sudo granted
+severity: high
+score: 55
+attack: [T1548.003]
+description: >
+  A NOPASSWD rule lets an account escalate to root with no credential. Cloud
+  images ship with one for their default user, which is why the exclusion
+  exists -- verify it against the image's own baseline before dismissing it.
+scope:
+  artifact_type: [persistence_file]
+match:
+  all:
+    - field: raw_data.kind
+      equals: sudoers
+    - field: raw_data.content
+      contains: "NOPASSWD"
+exclude:
+  - field: raw_data.name
+    equals_any: ["90-cloud-init-users", "90-cloud-init"]
+
+---
+id: MDL-0016
+title: Account added to a privileged group
+severity: high
+score: 45
+attack: [T1098]
+description: >
+  Membership in sudo, wheel, adm or docker is effectively root. docker
+  especially: anyone in that group can mount the host filesystem inside a
+  container and read or write anything.
+scope:
+  artifact_type: [persistence_file]
+match:
+  all:
+    - field: raw_data.kind
+      equals: group_membership
+    - field: raw_data.content
+      regex: "(?m)^(sudo|wheel|adm|docker|lxd):[^:]*:[^:]*:.+$"
+
+---
+id: MDL-0017
+title: Kernel module loaded at boot from a non-standard path
+severity: critical
+score: 70
+attack: [T1547.006]
+scope:
+  artifact_type: [persistence_file]
+match:
+  all:
+    - field: raw_data.kind
+      equals: kernel_module
+  any:
+    - field: raw_data.content
+      contains_any: ["/tmp/", "/dev/shm/", "/var/tmp/", "/home/", "/root/"]
+
+---
+id: MDL-0018
+title: Log or credential file sent to the trash
+severity: medium
+score: 35
+attack: [T1070.004]
+description: >
+  .trashinfo records the ORIGINAL PATH and the deletion time even after the
+  content is gone. Better metadata than the Windows Recycle Bin, and direct
+  evidence of cleanup. Scored medium because users delete things.
+scope:
+  artifact_type: [trash_item]
+match:
+  any:
+    - field: raw_data.original_path
+      contains_any: ["/var/log/", "/etc/", ".ssh/", ".bash_history",
+                     "/audit/", "id_rsa", "shadow"]
+
+---
+id: MDL-0019
+title: SSH configured to permit root login
+severity: medium
+score: 30
+attack: [T1078.003]
+description: >
+  Context, not an alert. Many environments still permit it. It matters when it
+  appears alongside a successful root SSH login from an unfamiliar address.
+scope:
+  artifact_type: [system_identity]
+match:
+  all:
+    - field: raw_data.file
+      equals: sshd_config
+    - field: raw_data.content
+      regex: "(?im)^\\s*PermitRootLogin\\s+(yes|without-password|prohibit-password)"
+
+---
+id: MDL-0020
+title: Running process from a writable or deleted path
+severity: high
+score: 60
+attack: [T1204.002, T1036]
+description: >
+  ps output captured at collection time. A process running from /tmp,
+  /dev/shm or a home directory, or one whose binary has been deleted, is
+  live evidence that no filesystem artifact records -- especially the
+  deleted case, where the file is simply not there to find.
+  /dev/shm is a tmpfs, so a binary staged there never touches persistent
+  storage at all.
+scope:
+  artifact_type: [process]
+match:
+  any:
+    - field: raw_data.command
+      contains_any: ["/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/",
+                     "(deleted)"]
+    - field: raw_data.command
+      regex: "(?i)(curl|wget)\\s+[^|]*\\|\\s*(bash|sh|python)"
+    - field: raw_data.command
+      contains_any: ["nc -e", "ncat -e", "/dev/tcp/", "socat "]
+exclude:
+  - field: raw_data.command
+    contains_any: ["/tmp/.X11-unix", "/tmp/systemd-", "snapd"]
+
+---
+id: MDL-0021
+title: Established connection to a non-private address
+severity: medium
+score: 40
+attack: [T1071.001]
+description: >
+  ss/netstat output captured at collection time. Scored medium because normal
+  hosts talk to the internet constantly; this is CONTEXT that becomes strong
+  when the same address appears in cron, shell history or auditd.
+  Loopback and RFC1918 are excluded: lateral movement is a separate question.
+scope:
+  artifact_type: [network_connection]
+match:
+  all:
+    - field: description
+      contains_any: ["ESTAB", "ESTABLISHED"]
+exclude:
+  - field: raw_data.remote
+    startswith_any: ["127.", "::1", "10.", "192.168.", "172.16.", "172.17.",
+                     "172.18.", "172.19.", "172.2", "172.30.", "172.31.",
+                     "169.254.", "0.0.0.0", "*", "["]

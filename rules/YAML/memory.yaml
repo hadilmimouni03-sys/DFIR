@@ -1,0 +1,533 @@
+
+# ==========================================================================
+# WINDOWS MEMORY
+# ==========================================================================
+
+id: MDM-W001
+title: Process running from a user-writable directory
+severity: high
+score: 55
+attack: [T1204.002, T1036]
+description: >
+  MDF-0001 finds EXECUTION EVIDENCE on disk -- Prefetch, Shimcache, Amcache.
+  This finds the process STILL RUNNING from that path at the moment of
+  acquisition, which is a stronger statement: not "this ran at some point"
+  but "this is live now".
+scope:
+  artifact_type: [memory_process, memory_process_scan, memory_cmdline]
+match:
+  any:
+    - field: description
+      contains_any: ["\\appdata\\local\\temp\\", "\\windows\\temp\\",
+                     "\\users\\public\\", "\\programdata\\",
+                     "\\$recycle.bin\\", "\\perflogs\\"]
+    - field: raw_data.Args
+      contains_any: ["\\appdata\\local\\temp\\", "\\windows\\temp\\",
+                     "\\users\\public\\", "\\perflogs\\"]
+exclude:
+  - field: description
+    contains_any: ["\\programdata\\chocolatey\\", "\\programdata\\package cache\\"]
+
+---
+id: MDM-W002
+title: System process name with the wrong parent or path
+severity: critical
+score: 80
+attack: [T1036.005, T1055]
+description: >
+  Masquerading. svchost.exe belongs in System32 and is started by services.exe;
+  lsass.exe is started by wininit.exe. A process using one of those names from
+  another path, or with an unexpected parent, is impersonating a system
+  binary -- one of the oldest and still most effective evasions.
+  Verify the parent PID against pslist before acting: PID reuse can produce a
+  false parent on a dump taken long after boot.
+scope:
+  artifact_type: [memory_process, memory_process_scan, memory_cmdline]
+match:
+  all:
+    - field: description
+      contains_any: ["svchost.exe", "lsass.exe", "csrss.exe", "winlogon.exe",
+                     "services.exe", "smss.exe", "wininit.exe", "spoolsv.exe"]
+  any:
+    - field: raw_data.Args
+      contains_any: ["\\temp\\", "\\appdata\\", "\\users\\", "\\programdata\\",
+                     "\\downloads\\"]
+    - field: description
+      regex: "(?i)(svchost|lsass|csrss|winlogon|services)\\.exe.*\\\\(temp|appdata|users|downloads)\\\\"
+
+---
+id: MDM-W003
+title: Outbound connection held by a script interpreter or LOLBin
+severity: high
+score: 65
+attack: [T1071.001, T1105]
+description: >
+  netscan attributes each connection to the process holding it. A browser with
+  an established connection is normal; powershell.exe, rundll32.exe or
+  mshta.exe holding one is a download stage or command-and-control.
+  This is a live socket at acquisition time, which no disk artifact records.
+scope:
+  artifact_type: [memory_network]
+match:
+  all:
+    - field: description
+      contains_any: ["powershell.exe", "pwsh.exe", "cmd.exe", "mshta.exe",
+                     "rundll32.exe", "regsvr32.exe", "certutil.exe",
+                     "wscript.exe", "cscript.exe", "bitsadmin.exe"]
+    - field: description
+      contains: ESTABLISHED
+exclude:
+  # loopback, link-local and private ranges: lateral movement is a different
+  # rule, this one is about egress
+  - field: raw_data.ForeignAddr
+    startswith_any: ["127.", "::1", "169.254.", "0.0.0.0", "-"]
+
+---
+id: MDM-W004
+title: Listening socket on an unusual port
+severity: high
+score: 60
+attack: [T1571, T1090]
+description: >
+  A process listening on a high or non-standard port is a backdoor or a
+  tunnel endpoint. Scored high rather than critical because development tools
+  legitimately listen -- the finding is WHICH process, and whether it belongs
+  on this host.
+scope:
+  artifact_type: [memory_network]
+match:
+  all:
+    - field: description
+      contains: LISTENING
+  any:
+    - field: description
+      contains_any: ["powershell.exe", "rundll32.exe", "mshta.exe", "cmd.exe",
+                     "wscript.exe", "regsvr32.exe"]
+    - field: raw_data.LocalPort
+      equals_any: ["4444", "4445", "1337", "31337", "8080", "8443", "9001",
+                   "1234", "12345", "5555", "6666"]
+
+---
+id: MDM-W005
+title: Injected memory region marked executable and writable
+severity: high
+score: 65
+attack: [T1055]
+description: >
+  MDF-0009 requires an MZ header, meaning a whole PE was mapped. This catches
+  the region regardless -- shellcode has no MZ. PAGE_EXECUTE_READWRITE on
+  private committed memory is what malfind exists to find, and legitimate
+  code very rarely needs both write and execute at once.
+  Expect JIT compilers (.NET, Java, browsers) to fire this; that is what the
+  exclusions are for.
+scope:
+  artifact_type: [memory_injection]
+match:
+  any:
+    - field: raw_data.Protection
+      contains_any: ["PAGE_EXECUTE_READWRITE", "PAGE_EXECUTE_WRITECOPY"]
+exclude:
+  - field: description
+    contains_any: ["chrome.exe", "msedge.exe", "firefox.exe", "java.exe",
+                   "javaw.exe", "devenv.exe", "Code.exe", "MsMpEng.exe"]
+
+---
+id: MDM-W006
+title: YARA rule matched in process memory
+severity: high
+score: 60
+attack: [T1055, T1027]
+description: >
+  A hit from vadyarascan. The severity here is a floor: the YARA rule's own
+  meta severity is what yara_scanner records on the detection, so a
+  credential-dumping rule still lands as critical.
+scope:
+  artifact_type: [memory_yara_hit]
+match:
+  any:
+    - field: artifact_type
+      equals: memory_yara_hit
+
+
+# ==========================================================================
+# LINUX MEMORY
+# ==========================================================================
+
+---
+id: MDM-L001
+title: Injected memory region with an ELF header
+severity: critical
+score: 75
+attack: [T1055]
+description: >
+  The Linux twin of MDF-0009. malfind found an executable private region; the
+  ELF magic confirms a whole binary was mapped there rather than shellcode.
+  Linux binaries are ELF not PE, so MDF-0009 correctly never fires here.
+scope:
+  artifact_type: [memory_injection]
+match:
+  any:
+    - field: raw_data._enrich.elf_header
+      is_true: true
+
+---
+id: MDM-L002
+title: LD_PRELOAD set in a process environment
+severity: critical
+score: 85
+attack: [T1574.006]
+description: >
+  MDL-0001 catches /etc/ld.so.preload -- the system-wide variant, which leaves
+  a file. This catches the PER-PROCESS variant, which leaves NOTHING ON DISK:
+  the variable is set in the parent's environment and inherited by the child.
+  Recovered from memory, so it survives the process exiting.
+  This is the single strongest argument for running linux.envars.
+scope:
+  artifact_type: [memory_environment]
+match:
+  all:
+    - field: raw_data._enrich.is_preload
+      is_true: true
+exclude:
+  # build systems and package managers legitimately set LD_LIBRARY_PATH
+  - field: raw_data.Value
+    contains_any: ["/usr/lib/", "/usr/local/lib/", "/lib/x86_64-linux-gnu",
+                   "/snap/", "/opt/rh/"]
+
+---
+id: MDM-L003
+title: Shared library loaded from a writable directory
+severity: critical
+score: 75
+attack: [T1574.006, T1055.001]
+description: >
+  A .so mapped into a running process from /tmp, /dev/shm or a home directory.
+  Distribution libraries live under /usr/lib and /lib; anything else was
+  placed there deliberately. Catches the case where LD_PRELOAD was unset after
+  the library had already loaded, so MDM-L002 would miss it.
+scope:
+  artifact_type: [memory_loaded_library]
+match:
+  any:
+    - field: raw_data.Path
+      contains_any: ["/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/",
+                     "/home/", "/root/"]
+
+---
+id: MDM-L004
+title: Hidden kernel module
+severity: critical
+score: 90
+attack: [T1014, T1547.006]
+description: >
+  A module the kernel is executing that is absent from the module list. There
+  is no benign reason for a module to unlink itself.
+  Note the match shape: the plugin only emits rows it already considers
+  anomalous, so the artifact EXISTING is the finding. That is unusual for a
+  rule and deliberate.
+scope:
+  artifact_type: [memory_hidden_module]
+match:
+  any:
+    - field: artifact_type
+      equals: memory_hidden_module
+
+---
+id: MDM-L005
+title: Syscall table entry hooked
+severity: critical
+score: 90
+attack: [T1014, T1547.006]
+description: >
+  A syscall handler pointing outside kernel text. Same reasoning as MDM-L004:
+  check_syscall reports only entries it considers anomalous, so any output is
+  the finding.
+scope:
+  artifact_type: [memory_syscall_hook]
+match:
+  any:
+    - field: artifact_type
+      equals: memory_syscall_hook
+
+---
+id: MDM-L006
+title: Kernel-level interception hook
+severity: critical
+score: 85
+attack: [T1014, T1056.001, T1040]
+description: >
+  Netfilter hooks intercept packets; tty hooks log keystrokes; ftrace hooks
+  repurpose function tracing for interception. All three are rootkit
+  capabilities with no ordinary use on an endpoint.
+scope:
+  artifact_type: [memory_netfilter_hook, memory_tty_hook, memory_ftrace_hook]
+match:
+  any:
+    - field: artifact_type
+      equals_any: [memory_netfilter_hook, memory_tty_hook, memory_ftrace_hook]
+
+---
+id: MDM-L007
+title: Process argv does not match its executable
+severity: critical
+score: 80
+attack: [T1036.004, T1055]
+description: >
+  Process spoofing. argv[0] claims one binary while the mapped executable is
+  another -- malware sets argv[0] to something like [kworker/0:1] to blend
+  into ps output. The real path is still in memory, which is how this is
+  caught and why no disk artifact shows it.
+scope:
+  artifact_type: [memory_process_spoof]
+match:
+  any:
+    - field: artifact_type
+      equals: memory_process_spoof
+
+---
+id: MDM-L008
+title: eBPF program loaded
+severity: high
+score: 55
+attack: [T1547.006]
+description: >
+  eBPF is the modern kernel hooking vector: it can intercept syscalls and
+  network traffic without loading a module, so none of the module-based
+  checks see it.
+  High rather than critical because Cilium, Falco and modern tracing tools
+  legitimately load eBPF. The finding is whether eBPF belongs on THIS host.
+scope:
+  artifact_type: [memory_ebpf_program]
+match:
+  any:
+    - field: artifact_type
+      equals: memory_ebpf_program
+
+---
+id: MDM-L009
+title: Filesystem mounted over a system directory
+severity: high
+score: 60
+attack: [T1564]
+description: >
+  A bind mount or tmpfs over /etc, /bin or /proc hides the real contents from
+  anything reading that path -- INCLUDING YOUR OWN COLLECTION. UAC would have
+  copied the overlay, not the real files. An anti-forensic technique aimed
+  directly at the acquisition.
+scope:
+  artifact_type: [memory_mount]
+match:
+  all:
+    - field: raw_data.MOUNT_PATH
+      startswith_any: ["/etc", "/bin", "/sbin", "/usr/bin", "/usr/sbin",
+                       "/boot", "/lib"]
+  any:
+    - field: raw_data.FSTYPE
+      equals_any: [tmpfs, ramfs, overlay]
+
+---
+id: MDM-L010
+title: Suspicious command recovered from in-memory shell history
+severity: critical
+score: 80
+attack: [T1059.004, T1070.003]
+description: >
+  linux.bash recovers history from MEMORY, so it survives `history -c` and a
+  wiped .bash_history -- and unlike the on-disk copy it carries a real
+  timestamp. If MDL-0004 found nothing on disk but this fires, the attacker
+  cleaned up and the memory copy caught them.
+scope:
+  artifact_type: [memory_shell_history]
+match:
+  any:
+    - field: raw_data.Command
+      contains_any: ["/dev/tcp/", "nc -e", "ncat -e", "bash -i >&",
+                     "history -c", "unset HISTFILE", "chattr -i", "shred ",
+                     "/etc/shadow", "id_rsa", "chmod +s", "setcap ",
+                     "base64 -d", "wget ", "curl "]
+    - field: raw_data.Command
+      regex: "(?i)(curl|wget)\\s+\\S+\\s*\\|\\s*(bash|sh|python)"
+
+---
+id: MDM-L011
+title: Process holding an outbound connection from a shell or interpreter
+severity: high
+score: 65
+attack: [T1071.001, T1105]
+description: >
+  The Linux counterpart of MDM-W003. sockstat attributes each socket to the
+  process holding it, so a shell or interpreter with an established outbound
+  connection is a reverse shell or a download stage.
+scope:
+  artifact_type: [memory_network]
+match:
+  all:
+    - field: description
+      contains_any: ["bash", "sh ", "zsh", "python", "perl", "ruby", "nc",
+                     "ncat", "socat", "curl", "wget"]
+    - field: description
+      contains_any: ["ESTABLISHED", "ESTAB"]
+exclude:
+  - field: description
+    contains_any: ["127.0.0.1", "::1", "0.0.0.0"]
+
+---
+id: MDM-L012
+title: Executable or library open from a writable directory
+severity: high
+score: 55
+attack: [T1204.002]
+description: >
+  lsof from memory: a process holding an open handle to a binary in /tmp or
+  /dev/shm at the moment of acquisition. /dev/shm especially -- it is a tmpfs,
+  so the file never touches persistent storage and no filesystem timeline
+  records it.
+scope:
+  artifact_type: [memory_open_file]
+match:
+  any:
+    - field: raw_data.Path
+      contains_any: ["/dev/shm/", "/tmp/", "/var/tmp/", "/run/user/"]
+exclude:
+  - field: raw_data.Path
+    contains_any: ["/tmp/.X11-unix/", "/tmp/systemd-", "/run/user/1000/gvfs"]
+
+# ==========================================================================
+# GAP-FILLING RULES -- added after auditing which artifact types no rule
+# consumed. See correlate.py for the four that need row-to-row comparison
+# (singleton processes, orphan parents, service binary mismatch, parent-child
+# pairs): the YAML engine compares a field to a LITERAL, never to another row.
+# ==========================================================================
+
+---
+id: MDM-L014
+title: Process masquerading as a Linux kernel thread
+severity: high
+score: 65
+attack: [T1036.005, T1134]
+description: >
+  Kernel threads are shown by ps in square brackets -- [kworker/0:1],
+  [kthreadd], [ksoftirqd/0] -- and they always run as root, uid 0. A process
+  using one of those names with a real user's uid is not a kernel thread; it
+  is a userland process wearing the name because nobody looks twice at
+  [kworker] in a process list.
+
+  THIS RULE WAS FILED AS MDM-W009 (WINDOWS) UNTIL IT WAS TESTED. Its title
+  claimed "system process running under an unexpected user" on Windows, but
+  the regex only ever matched Linux kernel-thread names and a uid= field --
+  neither of which appears anywhere in Windows pslist output, which carries
+  no user column at all. It could not fire on Windows evidence under any
+  circumstances, while being counted as Windows coverage. The Windows
+  equivalent is now MDM-W009, which compares the command-line path instead.
+scope:
+  artifact_type: [memory_process, memory_process_scan]
+match:
+  all:
+    - field: description
+      regex: "(?i)\\[k(worker|threadd|softirqd|swapd)[^\\]]*\\].*uid=[1-9]"
+
+---
+id: MDM-L013
+title: Running process holds a deleted executable
+severity: critical
+score: 80
+attack: [T1070.004, T1036]
+description: >
+  lsof marks a path "(deleted)" when the file is gone but a process still has
+  it open. On Linux you can execute a binary, delete it, and keep running --
+  the inode survives until the last handle closes.
+  This is the single most common Linux anti-forensic move, and NOTHING on
+  disk records it: the file is not there to find. Only memory shows it.
+scope:
+  artifact_type: [memory_open_file]
+match:
+  all:
+    - field: raw_data.Path
+      contains: "(deleted)"
+  any:
+    - field: raw_data.Path
+      regex: "(?i)/(tmp|dev/shm|var/tmp|home|root|run)/"
+    - field: raw_data.FD
+      equals_any: ["txt", "exe", "mem"]
+exclude:
+  # normal churn: browsers, package managers and systemd unlink temp files
+  # they are still using
+  - field: raw_data.Path
+    contains_any: ["/memfd:", "/dev/zero", "/SYSV", "/tmp/.X11-unix/",
+                   "/var/lib/dpkg/", "/var/cache/"]
+
+---
+id: MDM-W007
+title: Process with no command line where one is expected
+severity: medium
+score: 40
+attack: [T1055.012, T1036]
+description: >
+  A user-mode process whose command line is empty. Kernel processes (System,
+  Registry, Memory Compression) legitimately have none; a normal executable
+  does not. Hollowing and some injection techniques leave the PEB command
+  line blank or stale.
+  Scored medium: it is a lead that gains weight beside an injection or
+  network finding, not an alert on its own.
+scope:
+  artifact_type: [memory_cmdline]
+match:
+  all:
+    - field: description
+      contains: "(no command line)"
+exclude:
+  - field: description
+    contains_any: ["System pid=4", "Registry", "Memory Compression",
+                   "smss.exe", "MemCompression", "vmmem", "Secure System"]
+
+---
+id: MDM-W008
+title: Kernel module or driver loaded from a non-standard path
+severity: high
+score: 65
+attack: [T1014, T1547.006]
+description: >
+  Drivers belong under \Windows\System32\drivers. One loaded from a user
+  directory, ProgramData or a temp path is either a rootkit or an unsigned
+  tool -- both worth knowing about.
+  Also covers the Linux side, where a module path outside /lib/modules means
+  the same thing.
+scope:
+  artifact_type: [memory_kernel_module]
+match:
+  any:
+    - field: description
+      contains_any: ["\\users\\", "\\appdata\\", "\\temp\\", "\\programdata\\",
+                     "/tmp/", "/home/", "/dev/shm/", "/var/tmp/"]
+
+---
+id: MDM-W009
+title: Core Windows process running from outside the system directory
+severity: critical
+score: 80
+attack: [T1036.005]
+description: >
+  svchost.exe, lsass.exe and their peers ship in System32 and run from
+  nowhere else. A process using one of those names from Temp, AppData,
+  ProgramData or any other writable location is a masquerade: the name is
+  chosen to look ordinary in a process list.
+
+  WHY THIS READS THE COMMAND LINE AND NOT THE PROCESS LIST. pslist and
+  psscan record only ImageFileName -- "svchost.exe" -- with no path and no
+  user, so neither can tell a real svchost from a copy in Temp. The cmdline
+  plugin records the full invocation, which is the only place in a memory
+  dump where the path exists.
+
+  MATCHING IS DELIBERATELY LIMITED TO DRIVE-LETTER PATHS. The genuine
+  early-boot processes appear as "\\SystemRoot\\System32\\smss.exe",
+  "%SystemRoot%\\system32\\csrss.exe", or a bare "wininit.exe" with no path
+  at all. An earlier version of this rule flagged all thirteen of them.
+  Requiring an explicit X:\\ path that is not X:\\Windows\\ keeps those out
+  while still catching the realistic case -- a binary dropped in a
+  user-writable directory.
+scope:
+  artifact_type: [memory_cmdline]
+match:
+  all:
+    - field: description
+      regex: "(?i)\\b(?:svchost|lsass|services|winlogon|wininit|smss|csrss|spoolsv|taskhostw|dllhost|conhost)\\.exe pid=\\d+: \"?(?![A-Z]:\\\\Windows\\\\)[A-Z]:\\\\"
